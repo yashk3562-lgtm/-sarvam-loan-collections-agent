@@ -88,6 +88,7 @@ DEFAULT_STATE: dict[str, Any] = {
     "pending_confirmation": {},
     "last_agent_audio_b64": "",
     "agent_audio_by_message_index": {},
+    "borrower_audio_by_message_index": {},
     "last_audio_message_index": -1,
     "audio_rendered_for_index": -1,
     "pending_audio_autoplay": False,
@@ -924,42 +925,47 @@ def render_latest_agent_audio() -> None:
     if not st.session_state.get("pending_audio_autoplay", False):
         return
 
-    # Consume the autoplay event immediately so microphone-triggered Streamlit reruns cannot replay it.
+    # Consume immediately. The audio element is rendered only on the generation rerun,
+    # never on microphone-click reruns.
     st.session_state.pending_audio_autoplay = False
     st.session_state.audio_rendered_for_index = idx
 
     audio_key = hashlib.md5(f"autoplay:{idx}:{audio_b64[:80]}".encode("utf-8")).hexdigest()
 
-    st.markdown(
+    st.components.v1.html(
         f"""
-        <audio id="agent-autoplay-{audio_key}" autoplay playsinline preload="auto" style="width:1px;height:1px;opacity:0;position:absolute;left:-9999px;">
+        <audio id="agent-autoplay-{audio_key}" autoplay playsinline preload="auto" style="display:none;">
             <source src="data:audio/wav;base64,{audio_b64}" type="audio/wav">
         </audio>
         <script>
-            (function() {{
-                const audio = document.getElementById("agent-autoplay-{audio_key}");
-                if (!audio) {{ return; }}
+            const audio = document.getElementById("agent-autoplay-{audio_key}");
+            if (audio) {{
                 audio.muted = false;
                 audio.volume = 1.0;
-                const playOnce = () => audio.play().catch(() => {{}});
-                playOnce();
-                setTimeout(playOnce, 120);
-            }})();
+                audio.play().catch(() => {{}});
+            }}
         </script>
         """,
-        unsafe_allow_html=True,
+        height=0,
     )
 
 
-def render_saved_agent_audio(message_index: int) -> None:
-    audio_b64 = st.session_state.get("agent_audio_by_message_index", {}).get(message_index)
+def render_saved_audio(message_index: int, role: str) -> None:
+    if role == "assistant":
+        audio_b64 = st.session_state.get("agent_audio_by_message_index", {}).get(message_index)
+        label = "Agent voice"
+    else:
+        audio_b64 = st.session_state.get("borrower_audio_by_message_index", {}).get(message_index)
+        label = "Borrower voice"
+
     if not audio_b64:
         return
 
-    audio_key = hashlib.md5(f"saved:{message_index}:{audio_b64[:80]}".encode("utf-8")).hexdigest()
+    audio_key = hashlib.md5(f"saved:{role}:{message_index}:{audio_b64[:80]}".encode("utf-8")).hexdigest()
+    st.markdown(f"<div class='small-muted'>{label}</div>", unsafe_allow_html=True)
     st.markdown(
         f"""
-        <audio id="saved-agent-audio-{audio_key}" controls preload="metadata" style="width:100%; margin-top:8px;">
+        <audio id="saved-audio-{audio_key}" controls preload="metadata" style="width:100%; margin-top:6px;">
             <source src="data:audio/wav;base64,{audio_b64}" type="audio/wav">
         </audio>
         """,
@@ -1041,12 +1047,13 @@ with left:
             "Call is active. Record the borrower response; processing starts automatically after recording stops."
         )
 
+    show_saved_audio = st.session_state.call_ended
     for index, msg in enumerate(st.session_state.messages):
         with st.chat_message(msg["role"]):
             label = "Agent" if msg["role"] == "assistant" else "Borrower"
             st.write(f"**{label}:** {msg['content']}")
-            if msg["role"] == "assistant":
-                render_saved_agent_audio(index)
+            if show_saved_audio:
+                render_saved_audio(index, msg["role"])
 
     render_latest_agent_audio()
 
@@ -1077,6 +1084,8 @@ with left:
                     else:
                         st.session_state.last_transcript = transcript
                         st.session_state.messages.append({"role": "user", "content": transcript})
+                        borrower_message_index = len(st.session_state.messages) - 1
+                        st.session_state.borrower_audio_by_message_index[borrower_message_index] = base64.b64encode(audio_bytes).decode("utf-8")
 
                         with st.spinner("Sarvam 30B is generating the agent response..."):
                             reply = generate_reply(account, language, transcript)
