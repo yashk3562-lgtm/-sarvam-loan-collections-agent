@@ -181,6 +181,7 @@ def init_state() -> None:
 def reset_call() -> None:
     for key, value in DEFAULT_STATE.items():
         st.session_state[key] = deepcopy(value)
+    st.session_state.audio_rendered_for_index = -1
 
 
 init_state()
@@ -917,19 +918,35 @@ def render_latest_agent_audio() -> None:
     if not audio_b64 or idx < 0:
         return
 
+    # Prevent replaying the same agent audio on Streamlit reruns
+    if idx == st.session_state.get("audio_rendered_for_index", -1):
+        st.session_state.pending_audio_autoplay = False
+        return
+
     if not st.session_state.get("pending_audio_autoplay", False):
         return
 
     st.session_state.pending_audio_autoplay = False
     st.session_state.audio_rendered_for_index = idx
+
+    audio_key = hashlib.md5(
+        f"{idx}:{audio_b64[:80]}".encode("utf-8")
+    ).hexdigest()
+
     st.markdown(
         f"""
-        <audio id="latest-agent-audio" autoplay controls>
+        <audio id="latest-agent-audio-{audio_key}" controls>
             <source src="data:audio/wav;base64,{audio_b64}" type="audio/wav">
         </audio>
+
         <script>
-            const audio = document.getElementById("latest-agent-audio");
-            if (audio) {{ audio.play().catch(() => {{}}); }}
+            const audioKey = "sarvam_agent_audio_played_{audio_key}";
+            const audio = document.getElementById("latest-agent-audio-{audio_key}");
+
+            if (audio && sessionStorage.getItem(audioKey) !== "1") {{
+                sessionStorage.setItem(audioKey, "1");
+                audio.play().catch(() => {{}});
+            }}
         </script>
         """,
         unsafe_allow_html=True,
