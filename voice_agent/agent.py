@@ -87,6 +87,7 @@ DEFAULT_STATE: dict[str, Any] = {
     "last_audio_hash": "",
     "pending_confirmation": {},
     "last_agent_audio_b64": "",
+    "agent_audio_by_message_index": {},
     "last_audio_message_index": -1,
     "audio_rendered_for_index": -1,
     "pending_audio_autoplay": False,
@@ -906,8 +907,10 @@ def play_agent_audio(text: str, language: str, message_index: int | None = None)
 
     if audio_bytes:
         b64 = base64.b64encode(audio_bytes).decode("utf-8")
+        idx = message_index if message_index is not None else len(st.session_state.messages) - 1
         st.session_state.last_agent_audio_b64 = b64
-        st.session_state.last_audio_message_index = message_index if message_index is not None else len(st.session_state.messages) - 1
+        st.session_state.last_audio_message_index = idx
+        st.session_state.agent_audio_by_message_index[idx] = b64
         st.session_state.pending_audio_autoplay = True
 
 
@@ -921,37 +924,44 @@ def render_latest_agent_audio() -> None:
     if not st.session_state.get("pending_audio_autoplay", False):
         return
 
-    # Consume the autoplay event immediately so Streamlit reruns caused by the mic button cannot replay it.
+    # Consume the autoplay event immediately so microphone-triggered Streamlit reruns cannot replay it.
     st.session_state.pending_audio_autoplay = False
     st.session_state.audio_rendered_for_index = idx
 
-    audio_key = hashlib.md5(f"{idx}:{audio_b64[:80]}".encode("utf-8")).hexdigest()
+    audio_key = hashlib.md5(f"autoplay:{idx}:{audio_b64[:80]}".encode("utf-8")).hexdigest()
 
     st.markdown(
         f"""
-        <audio id="latest-agent-audio-{audio_key}" controls playsinline preload="auto">
+        <audio id="agent-autoplay-{audio_key}" autoplay playsinline preload="auto" style="width:1px;height:1px;opacity:0;position:absolute;left:-9999px;">
             <source src="data:audio/wav;base64,{audio_b64}" type="audio/wav">
         </audio>
-
         <script>
             (function() {{
-                const audio = document.getElementById("latest-agent-audio-{audio_key}");
+                const audio = document.getElementById("agent-autoplay-{audio_key}");
                 if (!audio) {{ return; }}
-
                 audio.muted = false;
                 audio.volume = 1.0;
-
-                const playOnce = () => {{
-                    audio.play().catch(() => {{}});
-                }};
-
-                if (document.readyState === "complete" || document.readyState === "interactive") {{
-                    setTimeout(playOnce, 80);
-                }} else {{
-                    document.addEventListener("DOMContentLoaded", () => setTimeout(playOnce, 80), {{ once: true }});
-                }}
+                const playOnce = () => audio.play().catch(() => {{}});
+                playOnce();
+                setTimeout(playOnce, 120);
             }})();
         </script>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_saved_agent_audio(message_index: int) -> None:
+    audio_b64 = st.session_state.get("agent_audio_by_message_index", {}).get(message_index)
+    if not audio_b64:
+        return
+
+    audio_key = hashlib.md5(f"saved:{message_index}:{audio_b64[:80]}".encode("utf-8")).hexdigest()
+    st.markdown(
+        f"""
+        <audio id="saved-agent-audio-{audio_key}" controls preload="metadata" style="width:100%; margin-top:8px;">
+            <source src="data:audio/wav;base64,{audio_b64}" type="audio/wav">
+        </audio>
         """,
         unsafe_allow_html=True,
     )
@@ -1031,10 +1041,12 @@ with left:
             "Call is active. Record the borrower response; processing starts automatically after recording stops."
         )
 
-    for msg in st.session_state.messages:
+    for index, msg in enumerate(st.session_state.messages):
         with st.chat_message(msg["role"]):
             label = "Agent" if msg["role"] == "assistant" else "Borrower"
             st.write(f"**{label}:** {msg['content']}")
+            if msg["role"] == "assistant":
+                render_saved_agent_audio(index)
 
     render_latest_agent_audio()
 
