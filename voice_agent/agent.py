@@ -935,7 +935,7 @@ def render_latest_agent_audio() -> None:
 
     st.markdown(
         f"""
-        <audio id="latest-agent-audio-{audio_key}" controls>
+        <audio id="latest-agent-audio-{audio_key}" controls autoplay playsinline preload="auto">
             <source src="data:audio/wav;base64,{audio_b64}" type="audio/wav">
         </audio>
 
@@ -943,10 +943,21 @@ def render_latest_agent_audio() -> None:
             const audioKey = "sarvam_agent_audio_played_{audio_key}";
             const audio = document.getElementById("latest-agent-audio-{audio_key}");
 
-            if (audio && sessionStorage.getItem(audioKey) !== "1") {{
-                sessionStorage.setItem(audioKey, "1");
-                audio.play().catch(() => {{}});
+            function playAgentAudioOnce() {{
+                if (!audio || window.sessionStorage.getItem(audioKey) === "1") {{
+                    return;
+                }}
+                window.sessionStorage.setItem(audioKey, "1");
+                audio.muted = false;
+                audio.volume = 1.0;
+                audio.play().catch(() => {{
+                    setTimeout(() => audio.play().catch(() => {{}}), 250);
+                }});
             }}
+
+            playAgentAudioOnce();
+            setTimeout(playAgentAudioOnce, 100);
+            setTimeout(playAgentAudioOnce, 400);
         </script>
         """,
         unsafe_allow_html=True,
