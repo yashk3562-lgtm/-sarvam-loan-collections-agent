@@ -385,6 +385,31 @@ def is_meta_or_instruction_reply(reply: str) -> bool:
     ]
     return any(term in lower for term in blocked)
 
+
+def reply_should_escalate_to_human(reply: str) -> bool:
+    lower = (reply or "").lower().strip()
+    uncertain_or_hallucinated = [
+        "i don't know",
+        "i dont know",
+        "i do not know",
+        "not sure",
+        "cannot determine",
+        "can't determine",
+        "unable to determine",
+        "not enough information",
+        "as an ai",
+        "language model",
+        "i cannot help",
+        "i can't help",
+        "i am confused",
+        "i'm confused",
+        "unknown response",
+        "fallback used",
+        "technical fallback",
+    ]
+    return is_meta_or_instruction_reply(reply) or any(term in lower for term in uncertain_or_hallucinated)
+
+
 # New agent turn normalization and generation logic
 def normalize_agent_turn(payload: dict[str, Any]) -> dict[str, Any]:
     reply = str(payload.get("reply", "")).strip()
@@ -448,6 +473,38 @@ def technical_fallback_turn(account: dict[str, Any] | None = None) -> dict[str, 
 
 def fallback_agent_turn(user_text: str, account: dict[str, Any] | None = None) -> dict[str, Any]:
     return technical_fallback_turn(account)
+
+
+def human_escalation_turn(account: dict[str, Any], reason: str = "Human callback queued") -> dict[str, Any]:
+    first_name = account.get("name", "").split()[0] or "customer"
+    return normalize_agent_turn({
+        "reply": f"Theek hai {first_name} ji. Main is case ko human callback ke liye mark kar raha hoon. Hamari team aapse follow up karegi.",
+        "outcome": "Escalation",
+        "risk_score": 88,
+        "next_action": reason,
+        "promise_date": "",
+        "needs_confirmation": False,
+        "call_ended": True,
+    })
+
+
+def safe_unknown_response_turn(
+    account: dict[str, Any],
+    conversation: list[dict[str, Any]],
+    user_text: str,
+    reason: str,
+) -> dict[str, Any]:
+    local_turn = apply_business_guardrails(fallback_agent_turn(user_text, account), account, conversation, user_text)
+    local_turn = prevent_repeated_negotiation_stage(local_turn, account, conversation, user_text)
+
+    if local_turn.get("outcome") in {"Promise Date Captured", "Promise-to-Pay"}:
+        return local_turn
+
+    if _job_loss_context(conversation, user_text):
+        return local_turn
+
+    st.session_state.last_agent_parse_error = reason
+    return human_escalation_turn(account, "Human callback queued")
 
 
 def apply_business_guardrails(
@@ -700,8 +757,8 @@ Keep under 22 words.
 
     if not reply:
         raise RuntimeError("Sarvam plain reply was empty")
-    if is_meta_or_instruction_reply(reply):
-        raise RuntimeError(f"Sarvam plain reply leaked instructions: {reply[:120]}")
+    if reply_should_escalate_to_human(reply):
+        raise RuntimeError(f"Sarvam plain reply was unsafe or uncertain: {reply[:120]}")
 
     st.session_state.last_agent_parse_error = "JSON parse failed; recovered with Sarvam plain reply: " + " | ".join(parse_errors[:2])
     return apply_business_guardrails(normalize_agent_turn({
@@ -767,13 +824,15 @@ def generate_agent_turn(account: dict[str, Any], language: str, user_text: str) 
     )
 
     if response.status_code >= 400:
-        st.session_state.last_agent_parse_error = (
-            f"Sarvam chat unavailable ({response.status_code}). "
-            "Used local collections guardrails for this turn."
+        return safe_unknown_response_turn(
+            account=account,
+            conversation=conversation,
+            user_text=user_text,
+            reason=(
+                f"Sarvam chat unavailable ({response.status_code}). "
+                "Routed to human callback unless promise-to-pay or hardship guardrails applied."
+            ),
         )
-        turn = apply_business_guardrails(fallback_agent_turn(user_text, account), account, conversation, user_text)
-        turn = prevent_repeated_negotiation_stage(turn, account, conversation, user_text)
-        return turn
 
     data = response.json()
     choices = data.get("choices") or []
@@ -792,9 +851,16 @@ def generate_agent_turn(account: dict[str, Any], language: str, user_text: str) 
 
     for index, raw in enumerate(raw_candidates, start=1):
         try:
-            turn = normalize_agent_turn(extract_json_object(raw))
-            if is_meta_or_instruction_reply(turn["reply"]):
-                raise ValueError(f"meta reply rejected: {turn['reply'][:120]}")
+            payload = extract_json_object(raw)
+            raw_reply = str(payload.get("reply", "")).strip()
+            if reply_should_escalate_to_human(raw_reply):
+                return safe_unknown_response_turn(
+                    account=account,
+                    conversation=conversation,
+                    user_text=user_text,
+                    reason="Agent reply looked hallucinated or uncertain. Routed to human callback.",
+                )
+            turn = normalize_agent_turn(payload)
             turn = apply_business_guardrails(turn, account, conversation, user_text)
             turn = prevent_repeated_negotiation_stage(turn, account, conversation, user_text)
             return turn
@@ -803,9 +869,16 @@ def generate_agent_turn(account: dict[str, Any], language: str, user_text: str) 
 
     for index, raw in enumerate(raw_candidates, start=1):
         try:
-            turn = normalize_agent_turn(repair_json_with_sarvam(raw, user_text))
-            if is_meta_or_instruction_reply(turn["reply"]):
-                raise ValueError(f"meta repair reply rejected: {turn['reply'][:120]}")
+            payload = repair_json_with_sarvam(raw, user_text)
+            raw_reply = str(payload.get("reply", "")).strip()
+            if reply_should_escalate_to_human(raw_reply):
+                return safe_unknown_response_turn(
+                    account=account,
+                    conversation=conversation,
+                    user_text=user_text,
+                    reason="Repaired agent reply looked hallucinated or uncertain. Routed to human callback.",
+                )
+            turn = normalize_agent_turn(payload)
             turn = apply_business_guardrails(turn, account, conversation, user_text)
             turn = prevent_repeated_negotiation_stage(turn, account, conversation, user_text)
             return turn
@@ -820,9 +893,12 @@ def generate_agent_turn(account: dict[str, Any], language: str, user_text: str) 
         parse_errors.append(f"plain Sarvam recovery failed: {exc}")
 
     st.session_state.last_agent_parse_error = " | ".join(parse_errors)
-    turn = apply_business_guardrails(fallback_agent_turn(user_text, account), account, conversation, user_text)
-    turn = prevent_repeated_negotiation_stage(turn, account, conversation, user_text)
-    return turn
+    return safe_unknown_response_turn(
+        account=account,
+        conversation=conversation,
+        user_text=user_text,
+        reason="Agent response could not be parsed safely. Routed to human callback.",
+    )
 
 
 def sarvam_tts(text: str, language: str) -> bytes | None:
