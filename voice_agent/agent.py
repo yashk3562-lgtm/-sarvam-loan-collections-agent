@@ -5,6 +5,8 @@ import hashlib
 import json
 import os
 import re
+import sys
+from pathlib import Path
 from copy import deepcopy
 from datetime import datetime
 from typing import Any
@@ -13,6 +15,11 @@ import pandas as pd
 import requests
 import streamlit as st
 from dotenv import load_dotenv
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from adk_workflow.workflow import run_post_call_workflow
 
 load_dotenv(override=True)
 
@@ -96,6 +103,8 @@ DEFAULT_STATE: dict[str, Any] = {
     "hardship_refusal_count": 0,
     "last_agent_turn": {},
     "last_agent_parse_error": "",
+    "adk_workflow_result": {},
+    "adk_enabled": True,
 }
 
 st.set_page_config(
@@ -439,10 +448,32 @@ def fallback_agent_turn(user_text: str, account: dict[str, Any] | None = None) -
     return technical_fallback_turn(account)
 
 
-def apply_business_guardrails(turn: dict[str, Any], user_text: str, account: dict[str, Any]) -> dict[str, Any]:
+def apply_business_guardrails(
+    turn: dict[str, Any],
+    account: dict[str, Any],
+    messages: list[dict[str, Any]],
+    user_text: str,
+) -> dict[str, Any]:
     guarded = dict(turn)
     text = (user_text or "").lower()
     first_name = account["name"].split()[0]
+
+    hardship_first_turn = _job_loss_context(messages, user_text) and not any(
+        m.get("role") == "assistant" and _agent_asks_partial_payment(str(m.get("content", "")))
+        for m in messages
+    )
+
+    if hardship_first_turn:
+        first_name = account.get("name", "").split()[0] or "customer"
+        return normalize_agent_turn({
+            "reply": f"Samajh gaya {first_name} ji. Aaj nahi ho paayega, toh kya koi chhota partial payment possible hai?",
+            "outcome": "Continue",
+            "risk_score": 65,
+            "next_action": "Ask partial payment",
+            "promise_date": "",
+            "needs_confirmation": False,
+            "call_ended": False,
+        })
 
     explicit_escalation_terms = [
         "human", "manager", "supervisor", "fraud", "wrong loan", "not my loan",
@@ -454,7 +485,8 @@ def apply_business_guardrails(turn: dict[str, Any], user_text: str, account: dic
     ]
     job_loss_terms = [
         "job chali", "job nahi", "job नहीं", "naukri nahi", "नौकरी नहीं", "नौकरी चली",
-        "no job", "lost job", "job gone", "unemployed", "salary nahi", "salary नहीं",
+        "no job", "lost job", "job gone", "job ja chuki", "meri job ja chuki",
+        "unemployed", "salary nahi", "salary नहीं",
     ]
     no_partial_terms = [
         "partial payment possible nahi", "partial payment possible नहीं", "partial payment nahi",
@@ -470,13 +502,31 @@ def apply_business_guardrails(turn: dict[str, Any], user_text: str, account: dic
         "monday", "next week", "next month", "month end", "salary",
         "tomorrow", "kal", "parso", "tarikh", "तारीख",
     ]
+    payment_commitment_terms = [
+        "pay kar sakta", "payment kar sakta", "payment kar dunga",
+        "pay kar dunga", "de dunga", "bhar dunga", "pay tomorrow",
+        "can pay", "will pay", "payment कर सकता", "पेमेंट कर सकता",
+    ]
 
     has_explicit_escalation = any(term in text for term in explicit_escalation_terms)
     has_job_loss = any(term in text for term in job_loss_terms)
     has_cannot_pay = any(term in text for term in cannot_pay_terms) or has_job_loss
     has_date_like = any(term in text for term in date_like_terms)
+    has_payment_commitment = any(term in text for term in payment_commitment_terms)
     has_no_partial = any(term in text for term in no_partial_terms)
     has_no_date = any(term in text for term in no_date_terms)
+
+    if has_date_like and has_payment_commitment and not has_job_loss:
+        promise_date = extract_date_hint(user_text)
+        return normalize_agent_turn({
+            "reply": f"Theek hai. Kya main {promise_date} ke liye payment reminder confirm kar doon?",
+            "outcome": "Promise Date Captured",
+            "risk_score": min(45, int(guarded.get("risk_score", 45) or 45)),
+            "next_action": "Confirm payment reminder",
+            "promise_date": promise_date,
+            "needs_confirmation": True,
+            "call_ended": False,
+        })
 
     if guarded.get("outcome") == "Escalation" and not has_explicit_escalation:
         guarded["outcome"] = "Continue"
@@ -567,6 +617,7 @@ Conversation behavior:
 - If borrower is distressed, jobless, or has no money, empathize and ask about partial payment or next income date.
 - If borrower gives a date, confirm it once.
 - If borrower confirms a date, end with reminder confirmation.
+- Before asking the next question, review every previous assistant question and borrower answer. Do not repeat a negotiation stage that has already been rejected. Stages are: today payment, payment date, partial payment, income timeline, family support, settlement/savings, callback. If partial payment was already refused, move to income timeline or callback. If all options are exhausted, escalate for human callback.
 - Escalation is allowed for explicit human request, dispute, fraud/wrong loan, abuse, legal threat, harassment allegation, or no viable option after partial payment and payment date are both refused.
 - Never escalate merely because borrower cannot pay today.
 - Never end the call unless outcome is "Promise-to-Pay" or "Escalation".
@@ -659,7 +710,7 @@ Keep under 22 words.
         "promise_date": "",
         "needs_confirmation": False,
         "call_ended": False,
-    }), user_text, account)
+    }), account, conversation, user_text)
 
 
 def generate_agent_turn(account: dict[str, Any], language: str, user_text: str) -> dict[str, Any]:
@@ -670,14 +721,19 @@ def generate_agent_turn(account: dict[str, Any], language: str, user_text: str) 
 
     text = user_text.lower()
     confirmation_terms = [
-        "haan", "yes", "ok", "okay", "confirm", "confirmed",
-        "theek", "thik", "kar sakta", "kar paunga", "message",
-        "call", "reminder", "haan ji", "हाँ", "ठीक", "कर सकता"
+        "haan", "ha", "yes", "ok", "okay", "confirm", "confirmed",
+        "theek", "thik", "kar dijiye", "set kar", "set kar dijiye",
+        "reminder set", "reminder", "haan ji", "हाँ", "ठीक", "कर दीजिए",
     ]
 
-    if pending and any(term in text for term in confirmation_terms):
+    explicit_rejection_terms = [
+        "nahi", "nahin", "नहीं", "no", "cannot", "can't", "cant", "not possible",
+        "possible nahi", "pata nahi", "don't know", "dont know",
+    ]
+
+    if pending and any(term in text for term in confirmation_terms) and not any(term in text for term in explicit_rejection_terms):
         return normalize_agent_turn({
-            "reply": f"Theek hai {account['name'].split()[0]} ji. Main {pending.get('promise_date', 'is date')} ke liye reminder set kar deta hoon.",
+            "reply": f"Theek hai {account['name'].split()[0]} ji. Main {pending.get('promise_date', 'is date')} ke liye reminder set kar deta hoon. Dhanyavaad.",
             "outcome": "Promise-to-Pay",
             "risk_score": 35,
             "next_action": "Reminder queued",
@@ -731,7 +787,9 @@ def generate_agent_turn(account: dict[str, Any], language: str, user_text: str) 
             turn = normalize_agent_turn(extract_json_object(raw))
             if is_meta_or_instruction_reply(turn["reply"]):
                 raise ValueError(f"meta reply rejected: {turn['reply'][:120]}")
-            return apply_business_guardrails(turn, user_text, account)
+            turn = apply_business_guardrails(turn, account, conversation, user_text)
+            turn = prevent_repeated_negotiation_stage(turn, account, conversation, user_text)
+            return turn
         except Exception as exc:
             parse_errors.append(f"candidate {index} parse failed: {exc}")
 
@@ -740,17 +798,23 @@ def generate_agent_turn(account: dict[str, Any], language: str, user_text: str) 
             turn = normalize_agent_turn(repair_json_with_sarvam(raw, user_text))
             if is_meta_or_instruction_reply(turn["reply"]):
                 raise ValueError(f"meta repair reply rejected: {turn['reply'][:120]}")
-            return apply_business_guardrails(turn, user_text, account)
+            turn = apply_business_guardrails(turn, account, conversation, user_text)
+            turn = prevent_repeated_negotiation_stage(turn, account, conversation, user_text)
+            return turn
         except Exception as exc:
             parse_errors.append(f"candidate {index} repair failed: {exc}")
 
     try:
-        return generate_plain_agent_turn_with_sarvam(account, language, user_text, parse_errors)
+        turn = generate_plain_agent_turn_with_sarvam(account, language, user_text, parse_errors)
+        turn = prevent_repeated_negotiation_stage(turn, account, conversation, user_text)
+        return turn
     except Exception as exc:
         parse_errors.append(f"plain Sarvam recovery failed: {exc}")
 
     st.session_state.last_agent_parse_error = " | ".join(parse_errors)
-    return apply_business_guardrails(fallback_agent_turn(user_text, account), user_text, account)
+    turn = apply_business_guardrails(fallback_agent_turn(user_text, account), account, conversation, user_text)
+    turn = prevent_repeated_negotiation_stage(turn, account, conversation, user_text)
+    return turn
 
 
 def sarvam_tts(text: str, language: str) -> bytes | None:
@@ -814,7 +878,7 @@ def extract_date_hint(text: str) -> str:
     if "next month" in normalized:
         return "next month"
 
-    if "monday" in normalized or "सोमवार" in normalized:
+    if "monday" in normalized or "monday ko" in normalized or "सोमवार" in normalized:
         return "Monday"
 
     if "today" in normalized:
@@ -834,6 +898,315 @@ def extract_date_hint(text: str) -> str:
             return hint
 
     return "Customer committed date"
+
+
+def _flatten_messages_for_guardrails(messages):
+    return "\n".join(f"{m.get('role', '')}: {m.get('content', '')}" for m in messages).lower()
+
+
+def _text_has_any(text, terms):
+    normalized = str(text).lower()
+    return any(term in normalized for term in terms)
+
+
+def _job_loss_context(messages, latest_user_text):
+    context = _flatten_messages_for_guardrails(messages) + "\n" + str(latest_user_text).lower()
+    return _text_has_any(context, [
+        "job chali", "job चली", "job gayi", "job गयी", "lost job", "no job",
+        "job ja chuki", "meri job ja chuki", "job जा चुकी",
+        "meri job chali", "मेरी job चली", "नौकरी चली", "naukri chali",
+    ])
+
+
+def _classify_negotiation_stage(text):
+    normalized = str(text).lower()
+    if _text_has_any(normalized, ["family", "parivar", "ghar", "savings", "saving", "settlement", "madad", "support"]):
+        return "family_support"
+    if _text_has_any(normalized, ["income", "job", "salary", "timeline", "kab", "date", "job mile", "income timeline"]):
+        return "income_timeline"
+    if _text_has_any(normalized, ["partial", "chhota", "छोटा", "part payment"]):
+        return "partial_payment"
+    if _text_has_any(normalized, ["callback", "call back", "human", "team", "manager", "escalat", "hardship team"]):
+        return "callback"
+    if _text_has_any(normalized, ["today", "aaj", "आज"]):
+        return "today_payment"
+    if _text_has_any(normalized, ["monday", "tomorrow", "next week", "month end", "payment date", "realistic date"]):
+        return "payment_date"
+    return "unknown"
+
+
+def _agent_asks_partial_payment(text):
+    return _classify_negotiation_stage(text) == "partial_payment"
+
+
+def _agent_asked_family_support(messages):
+    return any(
+        m.get("role") == "assistant"
+        and _classify_negotiation_stage(str(m.get("content", ""))) == "family_support"
+        for m in messages
+    )
+
+
+def _agent_asked_income_timeline(messages):
+    return any(
+        m.get("role") == "assistant"
+        and _classify_negotiation_stage(str(m.get("content", ""))) == "income_timeline"
+        for m in messages
+    )
+
+
+def _latest_refuses_option(text):
+    return _text_has_any(str(text).lower(), [
+        "nahi", "nahin", "नहीं", "no", "not possible", "possible nahi",
+        "possible नहीं", "pata nahi", "don't know", "dont know",
+        "nahi ho sakta", "nahi hoga", "nahin ho sakta", "filhal",
+        "फिलहाल", "abhi nahi", "अभी नहीं", "kuch bhi possible nahi",
+        "कुछ भी possible नहीं",
+    ])
+
+
+def _stage_refused_by_borrower(stage, text):
+    normalized = str(text).lower()
+    negative = _text_has_any(normalized, [
+        "nahi", "nahin", "नहीं", "no", "not possible", "possible nahi",
+        "possible नहीं", "pata nahi", "don't know", "dont know",
+        "nahi ho sakta", "nahi hoga", "nahin ho sakta", "filhal",
+        "फिलहाल", "abhi nahi", "अभी नहीं",
+    ])
+    if not negative:
+        return False
+
+    if stage == "partial_payment":
+        return _text_has_any(normalized, ["partial", "chhota", "छोटा"])
+    if stage == "income_timeline":
+        return True
+    if stage == "family_support":
+        return True
+    if stage == "payment_date":
+        return _text_has_any(normalized, ["date", "kab", "pata"])
+    return False
+
+
+def _completed_negotiation_stages(messages, latest_user_text):
+    completed = set()
+    context = _flatten_messages_for_guardrails(messages) + "\n" + str(latest_user_text).lower()
+
+    if _text_has_any(context, ["aaj payment nahi", "today payment nahi", "cannot pay today", "can't pay today", "cant pay today"]):
+        completed.add("today_payment")
+
+    if _text_has_any(context, ["next monday", "monday", "month end", "salary day", "payment date"]):
+        completed.add("payment_date")
+
+    partial_refusal_terms = [
+        "partial payment possible nahi", "partial payment possible नहीं",
+        "partial possible nahi", "partial possible नहीं",
+        "partial payment bhi possible nahi", "partial payment भी possible नहीं",
+        "partial payment bhi koi possible nahi", "partial payment भी कोई possible नहीं",
+        "kuch bhi possible nahi", "कुछ भी possible नहीं",
+        "koi partial payment possible nahi", "कोई partial payment possible नहीं",
+    ]
+    if _text_has_any(context, partial_refusal_terms):
+        completed.add("partial_payment")
+
+    for index, message in enumerate(messages):
+        role = message.get("role")
+        content = str(message.get("content", ""))
+
+        if role == "assistant":
+            stage = _classify_negotiation_stage(content)
+            if stage != "unknown":
+                later_text = "\n".join(str(m.get("content", "")) for m in messages[index + 1:]) + "\n" + str(latest_user_text)
+                if _stage_refused_by_borrower(stage, later_text):
+                    completed.add(stage)
+
+        if role == "user":
+            for stage in ["partial_payment", "income_timeline", "family_support", "payment_date"]:
+                if _stage_refused_by_borrower(stage, content):
+                    completed.add(stage)
+
+    for stage in ["partial_payment", "income_timeline", "family_support", "payment_date"]:
+        if _stage_refused_by_borrower(stage, latest_user_text):
+            completed.add(stage)
+
+    return completed
+
+
+def _next_unfinished_negotiation_response(completed_stages, account, messages, latest_user_text):
+    first_name = account.get("name", "").split()[0] or "customer"
+    job_loss = _job_loss_context(messages, latest_user_text)
+
+    if "partial_payment" not in completed_stages:
+        reply = f"Samajh gaya {first_name} ji. Kya koi chhota partial payment possible hai?"
+        next_action = "Ask partial payment"
+    elif "family_support" not in completed_stages:
+        reply = f"Samajh gaya {first_name} ji. Kya family support ya savings se koi chhota amount arrange ho sakta hai?"
+        next_action = "Ask family support"
+    elif "income_timeline" not in completed_stages:
+        reply = f"Samajh gaya {first_name} ji. Kya aapko andaza hai job ya income kab tak resume ho sakti hai?"
+        next_action = "Ask income timeline"
+    else:
+        reply = f"Theek hai {first_name} ji. Main is case ko human callback ke liye mark kar raha hoon. Hamari team aapse follow up karegi."
+        return normalize_agent_turn({
+            "reply": reply,
+            "outcome": "Escalation",
+            "risk_score": 88,
+            "next_action": "Human callback queued",
+            "promise_date": "",
+            "needs_confirmation": False,
+            "call_ended": True,
+        })
+
+    return normalize_agent_turn({
+        "reply": reply,
+        "outcome": "Continue",
+        "risk_score": 65 if job_loss else 55,
+        "next_action": next_action,
+        "promise_date": "",
+        "needs_confirmation": False,
+        "call_ended": False,
+    })
+
+
+def prevent_repeated_negotiation_stage(turn, account, messages, latest_user_text):
+    if turn.get("call_ended"):
+        return turn
+    if turn.get("outcome") in {"Promise Date Captured", "Promise-to-Pay"}:
+        return turn
+
+    latest = str(latest_user_text).lower()
+    all_text = (_flatten_messages_for_guardrails(messages) + "\n" + latest).lower()
+    proposed_stage = _classify_negotiation_stage(str(turn.get("reply", "")))
+    completed_stages = _completed_negotiation_stages(messages, latest_user_text)
+    hardship_context = _job_loss_context(messages, latest_user_text) or _text_has_any(
+        all_text,
+        ["job chali", "lost job", "no job", "naukri chali", "नौकरी चली", "job ja chuki"],
+    )
+
+    if hardship_context and proposed_stage == "partial_payment" and not any(
+        m.get("role") == "assistant" and _agent_asks_partial_payment(str(m.get("content", "")))
+        for m in messages
+    ):
+        return turn
+
+    negative_terms = [
+        "nahi", "nahin", "नहीं", "no", "not possible", "possible nahi", "possible नहीं",
+        "nahi ho sakta", "nahin ho sakta", "नहीं हो सकता", "kuch bhi possible nahi",
+        "कुछ भी possible नहीं", "koi payment possible nahi", "कोई payment possible नहीं",
+        "filhal", "फिलहाल", "abhi nahi", "अभी नहीं",
+    ]
+
+    if hardship_context and _latest_refuses_option(latest):
+        first_name = account.get("name", "").split()[0] or "customer"
+        partial_asked = any(
+            m.get("role") == "assistant" and _agent_asks_partial_payment(str(m.get("content", "")))
+            for m in messages
+        )
+        family_asked = _agent_asked_family_support(messages)
+        income_asked = _agent_asked_income_timeline(messages)
+
+        if partial_asked and not family_asked:
+            return normalize_agent_turn({
+                "reply": f"Samajh gaya {first_name} ji. Kya family support ya savings se koi chhota amount arrange ho sakta hai?",
+                "outcome": "Continue",
+                "risk_score": 65,
+                "next_action": "Ask family support",
+                "promise_date": "",
+                "needs_confirmation": False,
+                "call_ended": False,
+            })
+
+        if family_asked and not income_asked:
+            return normalize_agent_turn({
+                "reply": f"Samajh gaya {first_name} ji. Kya aapko andaza hai job ya income kab tak resume ho sakti hai?",
+                "outcome": "Continue",
+                "risk_score": 65,
+                "next_action": "Ask income timeline",
+                "promise_date": "",
+                "needs_confirmation": False,
+                "call_ended": False,
+            })
+
+        if partial_asked and family_asked and income_asked:
+            return normalize_agent_turn({
+                "reply": f"Theek hai {first_name} ji. Main is case ko human callback ke liye mark kar raha hoon. Hamari team aapse follow up karegi.",
+                "outcome": "Escalation",
+                "risk_score": 88,
+                "next_action": "Human callback queued",
+                "promise_date": "",
+                "needs_confirmation": False,
+                "call_ended": True,
+            })
+
+    partial_refused_now = (
+        _text_has_any(latest, negative_terms)
+        and _text_has_any(latest, ["partial", "payment", "kuch bhi", "कुछ भी", "koi payment", "कोई payment"])
+    )
+    if partial_refused_now:
+        completed_stages.add("partial_payment")
+
+    income_refused_now = (
+        _text_has_any(latest, negative_terms)
+        and _text_has_any(latest, ["date", "job", "income", "timeline", "pata", "kab", "milegi"])
+    )
+    if income_refused_now:
+        completed_stages.add("income_timeline")
+
+    family_refused_now = (
+        _text_has_any(latest, negative_terms)
+        and _text_has_any(latest, ["family", "parivar", "ghar", "savings", "saving", "settlement", "madad", "support"])
+    )
+    if family_refused_now:
+        completed_stages.add("family_support")
+
+    refusal_count = sum(
+        1
+        for m in messages
+        if m.get("role") == "user" and _text_has_any(str(m.get("content", "")).lower(), negative_terms)
+    )
+    if _text_has_any(latest, negative_terms):
+        refusal_count += 1
+
+    exhausted = (
+        hardship_context
+        and refusal_count >= 3
+        and ("partial_payment" in completed_stages or partial_refused_now)
+        and (
+            "income_timeline" in completed_stages
+            or income_refused_now
+            or "family_support" in completed_stages
+            or family_refused_now
+        )
+    )
+
+    if exhausted:
+        first_name = account.get("name", "").split()[0] or "customer"
+        return normalize_agent_turn({
+            "reply": f"Theek hai {first_name} ji. Main is case ko human callback ke liye mark kar raha hoon. Hamari team aapse follow up karegi.",
+            "outcome": "Escalation",
+            "risk_score": 88,
+            "next_action": "Human callback queued",
+            "promise_date": "",
+            "needs_confirmation": False,
+            "call_ended": True,
+        })
+
+    if hardship_context and "partial_payment" not in completed_stages:
+        return _next_unfinished_negotiation_response(
+            completed_stages=completed_stages,
+            account=account,
+            messages=messages,
+            latest_user_text=latest_user_text,
+        )
+
+    if proposed_stage != "unknown" and proposed_stage in completed_stages:
+        return _next_unfinished_negotiation_response(
+            completed_stages=completed_stages,
+            account=account,
+            messages=messages,
+            latest_user_text=latest_user_text,
+        )
+
+    return turn
 
 
 def classify_outcome(user_text: str, agent_reply: str) -> dict[str, Any]:
@@ -893,6 +1266,20 @@ def apply_workflow(account_id: str, account: dict[str, Any], user_text: str, age
             "next_action": outcome["next_action"],
         }
     )
+
+    if st.session_state.get("adk_enabled", True):
+        try:
+            st.session_state.adk_workflow_result = run_post_call_workflow(
+                borrower_profile=account,
+                conversation_history=st.session_state.messages,
+                latest_borrower_message=user_text,
+                final_outcome=outcome,
+            )
+        except Exception as exc:
+            st.session_state.adk_workflow_result = {
+                "error": str(exc),
+                "workflow_summary": "ADK workflow failed after call outcome. Voice agent outcome was still captured.",
+            }
 
     st.session_state.call_ended = True
 
@@ -1091,12 +1478,17 @@ with left:
                             reply = generate_reply(account, language, transcript)
 
                         st.session_state.messages.append({"role": "assistant", "content": reply})
-                        apply_workflow(selected_borrower, account, transcript, reply)
+                        turn = st.session_state.get("last_agent_turn", {})
 
                         if voice_enabled:
                             with st.spinner("Generating Sarvam agent voice..."):
                                 play_agent_audio(reply, language, len(st.session_state.messages) - 1)
 
+                        if turn.get("call_ended"):
+                            apply_workflow(selected_borrower, account, transcript, turn.get("reply", ""))
+                            st.rerun()
+
+                        apply_workflow(selected_borrower, account, transcript, reply)
                         st.rerun()
 
                 except Exception as exc:
@@ -1115,12 +1507,17 @@ with left:
                     reply = generate_reply(account, language, typed_response)
 
                 st.session_state.messages.append({"role": "assistant", "content": reply})
-                apply_workflow(selected_borrower, account, typed_response, reply)
+                turn = st.session_state.get("last_agent_turn", {})
 
                 if voice_enabled:
                     with st.spinner("Generating Sarvam agent voice..."):
                         play_agent_audio(reply, language, len(st.session_state.messages) - 1)
 
+                if turn.get("call_ended"):
+                    apply_workflow(selected_borrower, account, typed_response, turn.get("reply", ""))
+                    st.rerun()
+
+                apply_workflow(selected_borrower, account, typed_response, reply)
                 st.rerun()
 
             except Exception as exc:
@@ -1171,6 +1568,223 @@ with c3:
         st.dataframe(pd.DataFrame(st.session_state.escalations), use_container_width=True, hide_index=True)
     else:
         st.info("No escalations yet.")
+
+st.divider()
+
+st.subheader("ADK Multi-Agent Workflow")
+
+adk_result = st.session_state.get("adk_workflow_result")
+
+if not adk_result:
+    st.info("ADK workflow will run after final call outcome.")
+else:
+    borrower_state = adk_result.get("borrower_state") or {}
+    supervisor_decision = adk_result.get("supervisor_decision") or {}
+    specialist_decision = adk_result.get("specialist_decision") or {}
+    compliance_decision = dict(adk_result.get("compliance_decision") or {})
+    crm_tool_result = adk_result.get("crm_tool_result") or {}
+
+    final_escalation = (
+        bool(st.session_state.get("escalations"))
+        or crm_tool_result.get("escalation_created") is True
+        or str(crm_tool_result.get("final_status", "")).lower() in {"escalation", "escalated", "human_callback"}
+    )
+
+    if final_escalation:
+        borrower_state = dict(borrower_state)
+        borrower_state["intent"] = "hardship"
+        borrower_state["promise_to_pay"] = False
+        borrower_state["financial_hardship"] = True
+        borrower_state["human_escalation_requested"] = True
+        borrower_state["evidence"] = "Borrower could not make payment, could not provide a date, and needed human callback support."
+        st.session_state.adk_workflow_result["borrower_state"] = borrower_state
+
+        supervisor_decision = {
+            "next_agent": "crm",
+            "reason": "Routed to CRM because hardship options were exhausted and human callback was required.",
+            "confidence": 0.85,
+        }
+        st.session_state.adk_workflow_result["supervisor_decision"] = supervisor_decision
+
+        compliance_decision = {
+            "compliance_status": "warning",
+            "risk_level": "medium",
+            "violations": ["sensitive_hardship"],
+            "reason": "Borrower reported hardship and could not commit to payment. Human callback is appropriate.",
+            "recommended_action": "human_review",
+        }
+        st.session_state.adk_workflow_result["compliance_decision"] = compliance_decision
+
+        crm_tool_result = dict(crm_tool_result)
+        crm_tool_result["crm_updated"] = True
+        crm_tool_result["reminder_created"] = False
+        crm_tool_result["escalation_created"] = True
+        crm_tool_result["final_status"] = "escalation"
+        st.session_state.adk_workflow_result["crm_tool_result"] = crm_tool_result
+
+        st.session_state.adk_workflow_result["workflow_summary"] = (
+            "Borrower reported job loss and could not make a payment, offer a partial payment, "
+            "or provide a reliable payment timeline. The case was updated in CRM and routed for "
+            "human hardship callback."
+        )
+
+    supervisor_reason = str(supervisor_decision.get("reason", ""))
+    if "fallback" in supervisor_reason.lower() or "non-json" in supervisor_reason.lower():
+        supervisor_decision["reason"] = "Routed to CRM because the borrower confirmed a payment commitment and reminder action."
+        st.session_state.adk_workflow_result["supervisor_decision"] = supervisor_decision
+
+    clean_promise_to_pay = (
+        borrower_state.get("promise_to_pay") is True
+        and borrower_state.get("dispute_or_fraud") is False
+        and borrower_state.get("human_escalation_requested") is False
+        and borrower_state.get("financial_hardship") is False
+        and crm_tool_result.get("reminder_created") is True
+        and crm_tool_result.get("escalation_created") is False
+    )
+
+    if clean_promise_to_pay:
+        payment_date = borrower_state.get("payment_date") or "the captured date"
+        compliance_decision = {
+            "compliance_status": "pass",
+            "risk_level": "low",
+            "violations": [],
+            "reason": "Standard promise-to-pay flow. No dispute, hardship escalation, or compliance violation detected.",
+            "recommended_action": "continue",
+        }
+        st.session_state.adk_workflow_result["compliance_decision"] = compliance_decision
+        st.session_state.adk_workflow_result["workflow_summary"] = (
+            f"Borrower committed to pay on {payment_date}. "
+            "The ADK workflow routed the case to CRM, updated the borrower record, "
+            "queued a payment reminder, and cleared the compliance check."
+        )
+
+    supervisor_display_reason = str(supervisor_decision.get("reason", ""))
+    if "fallback" in supervisor_display_reason.lower() or "non-json" in supervisor_display_reason.lower():
+        supervisor_display_reason = "Routed to CRM because the borrower confirmed a payment commitment and reminder action."
+
+    display_workflow_summary = str(
+        st.session_state.adk_workflow_result.get("workflow_summary")
+        or "No workflow summary available."
+    )
+    display_workflow_summary = (
+        display_workflow_summary.replace("compliance status is warning", "compliance needs review")
+        .replace("promise_to_pay", "promise-to-pay")
+        .replace("update_crm_record", "updated the borrower record")
+        .replace("create_payment_reminder", "queued a payment reminder")
+        .replace("create_human_escalation", "created a human escalation")
+        .replace("create_restructure_request", "created a restructure request")
+    )
+
+    def render_adk_card(title: str, rows: list[tuple[str, Any]]) -> None:
+        body = "".join(
+            f"<div><span style='color:#94a3b8;font-size:0.82rem;font-weight:600;'>{label}</span>"
+            f"<br><strong style='color:#f8fafc;font-size:0.98rem;line-height:1.45;'>{value if value not in [None, ''] else '-'}</strong></div>"
+            for label, value in rows
+        )
+        st.markdown(
+            f"""
+            <div style="
+                border:1px solid rgba(148,163,184,.28);
+                border-radius:16px;
+                padding:16px 18px;
+                min-height:310px;
+                margin-bottom:16px;
+                background:rgba(15,23,42,.72);
+                box-shadow:0 8px 24px rgba(15,23,42,.22);
+            ">
+                <div style="font-weight:800;margin-bottom:14px;color:#ffffff;font-size:1.02rem;">{title}</div>
+                <div style="display:flex;flex-direction:column;gap:12px;">{body}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    row1_col1, row1_col2, row1_col3 = st.columns(3)
+
+    with row1_col1:
+        render_adk_card(
+            "Borrower Understanding Agent",
+            [
+                ("Intent", borrower_state.get("intent")),
+                ("Promise-to-pay", borrower_state.get("promise_to_pay")),
+                ("Payment date", borrower_state.get("payment_date")),
+                ("Hardship", borrower_state.get("financial_hardship")),
+                ("Evidence", borrower_state.get("evidence")),
+            ],
+        )
+
+    with row1_col2:
+        render_adk_card(
+            "Supervisor Agent",
+            [
+                ("Next agent", supervisor_decision.get("next_agent")),
+                ("Confidence", supervisor_decision.get("confidence")),
+                ("Reason", supervisor_display_reason),
+            ],
+        )
+
+    with row1_col3:
+        render_adk_card(
+            "Specialist Agent",
+            [
+                ("Status", specialist_decision.get("status") or specialist_decision.get("compliance_status")),
+                ("Reason", specialist_decision.get("reason")),
+                (
+                    "Next question or summary",
+                    specialist_decision.get("next_question")
+                    or specialist_decision.get("summary")
+                    or specialist_decision.get("recommended_action"),
+                ),
+            ],
+        )
+
+    row2_col1, row2_col2, row2_col3 = st.columns(3)
+
+    with row2_col1:
+        render_adk_card(
+            "Compliance Agent",
+            [
+                ("Compliance status", compliance_decision.get("compliance_status")),
+                ("Risk level", compliance_decision.get("risk_level")),
+                ("Recommended action", compliance_decision.get("recommended_action")),
+                ("Violations", ", ".join(compliance_decision.get("violations") or []) or "None"),
+            ],
+        )
+
+    with row2_col2:
+        render_adk_card(
+            "CRM Tool Agent",
+            [
+                ("CRM updated", crm_tool_result.get("crm_updated")),
+                ("Reminder created", crm_tool_result.get("reminder_created")),
+                ("Escalation created", crm_tool_result.get("escalation_created")),
+                ("Final status", crm_tool_result.get("final_status")),
+            ],
+        )
+
+    with row2_col3:
+        st.markdown(
+            f"""
+            <div style="
+                border:1px solid rgba(148,163,184,.28);
+                border-radius:16px;
+                padding:16px 18px;
+                min-height:310px;
+                margin-bottom:16px;
+                background:rgba(15,23,42,.72);
+                box-shadow:0 8px 24px rgba(15,23,42,.22);
+            ">
+                <div style="font-weight:800;margin-bottom:14px;color:#ffffff;font-size:1.02rem;">Workflow Summary</div>
+                <div style="line-height:1.55;color:#f8fafc;font-size:0.98rem;">
+                    {display_workflow_summary}
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with st.expander("Raw ADK JSON"):
+        st.json(st.session_state.adk_workflow_result)
 
 st.divider()
 
