@@ -100,6 +100,7 @@ DEFAULT_STATE: dict[str, Any] = {
     "last_audio_message_index": -1,
     "audio_rendered_for_index": -1,
     "pending_audio_autoplay": False,
+    "play_initial_greeting_now": False,
     "no_commitment_count": 0,
     "hardship_refusal_count": 0,
     "last_agent_turn": {},
@@ -1345,6 +1346,53 @@ def render_latest_agent_audio() -> None:
     )
 
 
+def render_initial_greeting_audio(message_index: int, message: dict[str, Any]) -> None:
+    if not st.session_state.get("play_initial_greeting_now", False):
+        return
+
+    audio_b64 = message.get("audio_b64") or st.session_state.get("agent_audio_by_message_index", {}).get(message_index)
+
+    if not audio_b64:
+        st.session_state.play_initial_greeting_now = False
+        return
+
+    st.session_state.play_initial_greeting_now = False
+    st.session_state.pending_audio_autoplay = False
+    st.session_state.audio_rendered_for_index = message_index
+
+    audio_key = message.get("audio_key") or hashlib.md5(f"initial:{message_index}:{audio_b64[:80]}".encode("utf-8")).hexdigest()
+
+    st.components.v1.html(
+        f"""
+        <div style="display:flex; align-items:center; gap:8px; margin-top:6px;">
+            <audio id="initial-greeting-audio-{audio_key}" autoplay playsinline preload="auto" style="display:none;">
+                <source src="data:audio/wav;base64,{audio_b64}" type="audio/wav">
+            </audio>
+            <button
+                id="initial-greeting-button-{audio_key}"
+                type="button"
+                style="display:none; border:1px solid #d0d5dd; border-radius:6px; padding:4px 10px; background:#ffffff; color:#344054; cursor:pointer; font-size:13px;"
+            >
+                Play greeting
+            </button>
+        </div>
+        <script>
+            const audio = document.getElementById("initial-greeting-audio-{audio_key}");
+            const button = document.getElementById("initial-greeting-button-{audio_key}");
+            if (audio && button) {{
+                audio.muted = false;
+                audio.volume = 1.0;
+                button.onclick = () => audio.play().catch(() => {{}});
+                audio.play()
+                    .then(() => {{ button.style.display = "none"; }})
+                    .catch(() => {{ button.style.display = "inline-flex"; }});
+            }}
+        </script>
+        """,
+        height=46,
+    )
+
+
 def render_saved_audio(message_index: int, role: str) -> None:
     if role == "assistant":
         audio_b64 = st.session_state.get("agent_audio_by_message_index", {}).get(message_index)
@@ -1438,7 +1486,7 @@ with left:
             if voice_enabled:
                 with st.spinner("Generating Sarvam opening voice..."):
                     play_agent_audio(first_reply, language, assistant_message_index)
-            st.rerun()
+                st.session_state.play_initial_greeting_now = True
     else:
         st.caption(
             "Call is active. Record the borrower response; processing starts automatically after recording stops."
@@ -1449,6 +1497,8 @@ with left:
         with st.chat_message(msg["role"]):
             label = "Agent" if msg["role"] == "assistant" else "Borrower"
             st.write(f"**{label}:** {msg['content']}")
+            if index == 0 and msg["role"] == "assistant":
+                render_initial_greeting_audio(index, msg)
             if show_saved_audio:
                 render_saved_audio(index, msg["role"])
 
