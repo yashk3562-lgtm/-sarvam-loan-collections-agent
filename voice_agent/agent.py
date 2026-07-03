@@ -767,7 +767,13 @@ def generate_agent_turn(account: dict[str, Any], language: str, user_text: str) 
     )
 
     if response.status_code >= 400:
-        raise RuntimeError(f"Sarvam chat failed: {response.status_code} - {parse_error(response)}")
+        st.session_state.last_agent_parse_error = (
+            f"Sarvam chat unavailable ({response.status_code}). "
+            "Used local collections guardrails for this turn."
+        )
+        turn = apply_business_guardrails(fallback_agent_turn(user_text, account), account, conversation, user_text)
+        turn = prevent_repeated_negotiation_stage(turn, account, conversation, user_text)
+        return turn
 
     data = response.json()
     choices = data.get("choices") or []
