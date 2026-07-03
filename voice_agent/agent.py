@@ -1002,6 +1002,27 @@ def _job_loss_context(messages, latest_user_text):
     ])
 
 
+def _hardship_context(messages, latest_user_text):
+    context = _flatten_messages_for_guardrails(messages) + "\n" + str(latest_user_text).lower()
+    return _job_loss_context(messages, latest_user_text) or _text_has_any(context, [
+        "medical emergency", "hospital", "illness", "bimari", "बीमारी",
+        "financial hardship", "hardship", "paise nahi", "पैसे नहीं",
+        "income nahi", "income नहीं", "salary nahi", "salary नहीं",
+        "ghar mein problem", "घर में problem",
+    ])
+
+
+def _paid_or_dispute_context(messages, latest_user_text):
+    context = _flatten_messages_for_guardrails(messages) + "\n" + str(latest_user_text).lower()
+    return _text_has_any(context, [
+        "already paid", "paid already", "repaid", "repay kar chuka",
+        "repay कर चुका", "payment kar chuka", "payment कर चुका",
+        "loan repay", "paid this loan", "ye loan pay", "यह loan repay",
+        "wrong loan", "not my loan", "mera loan nahi", "मेरा loan नहीं",
+        "fraud", "गलत loan", "galat loan",
+    ])
+
+
 def _classify_negotiation_stage(text):
     normalized = str(text).lower()
     if _text_has_any(normalized, ["family", "parivar", "ghar", "savings", "saving", "settlement", "madad", "support"]):
@@ -1733,28 +1754,82 @@ else:
     )
 
     if final_escalation:
+        hardship_context = _hardship_context(st.session_state.messages, "")
+        job_loss_context = _job_loss_context(st.session_state.messages, "")
+        paid_or_dispute_context = _paid_or_dispute_context(st.session_state.messages, "")
+
         borrower_state = dict(borrower_state)
-        borrower_state["intent"] = "hardship"
         borrower_state["promise_to_pay"] = False
-        borrower_state["financial_hardship"] = True
         borrower_state["human_escalation_requested"] = True
-        borrower_state["evidence"] = "Borrower could not make payment, could not provide a date, and needed human callback support."
+
+        if hardship_context:
+            borrower_state["intent"] = "hardship"
+            borrower_state["financial_hardship"] = True
+            borrower_state["job_status"] = "lost_job" if job_loss_context else "unknown"
+            borrower_state["evidence"] = (
+                "Borrower described job loss and needed human callback support."
+                if job_loss_context
+                else "Borrower described financial hardship and needed human callback support."
+            )
+            supervisor_reason = "Routed to hardship because borrower hardship required human callback support."
+            compliance_decision = {
+                "compliance_status": "pass",
+                "risk_level": "medium",
+                "violations": [],
+                "reason": "Borrower hardship was detected. No explicit compliance violation was found.",
+                "recommended_action": "continue",
+            }
+            workflow_summary = (
+                "Borrower reported job loss and needed human callback support. The case was updated in CRM and routed for human follow-up."
+                if job_loss_context
+                else "Borrower reported financial hardship and needed human callback support. The case was updated in CRM and routed for human follow-up."
+            )
+        elif paid_or_dispute_context:
+            borrower_state["intent"] = "dispute"
+            borrower_state["financial_hardship"] = False
+            borrower_state["job_status"] = "unknown"
+            borrower_state["dispute_or_fraud"] = True
+            borrower_state["evidence"] = "Borrower claimed the loan was already repaid or disputed the loan."
+            supervisor_reason = "Routed for human review because the borrower claimed the loan was already repaid or disputed the account."
+            compliance_decision = {
+                "compliance_status": "warning",
+                "risk_level": "medium",
+                "violations": ["dispute_or_paid_claim"],
+                "reason": "Borrower claimed repayment or disputed the loan. Human review is required before further collections action.",
+                "recommended_action": "human_review",
+            }
+            workflow_summary = (
+                "Borrower claimed the loan was already repaid or disputed the account. "
+                "The case was updated in CRM and routed for human review."
+            )
+        else:
+            borrower_state["intent"] = "callback_request"
+            borrower_state["financial_hardship"] = False
+            borrower_state["job_status"] = "unknown"
+            borrower_state["dispute_or_fraud"] = False
+            borrower_state["evidence"] = "Agent could not safely determine the next automated step, so human callback was queued."
+            supervisor_reason = "Routed for human callback because the automated agent could not safely determine the next step."
+            compliance_decision = {
+                "compliance_status": "pass",
+                "risk_level": "low",
+                "violations": [],
+                "reason": "No explicit compliance violation was detected. Human callback was queued because the automated flow could not safely continue.",
+                "recommended_action": "escalate",
+            }
+            workflow_summary = (
+                "The automated agent could not safely determine the next step. "
+                "The case was updated in CRM and routed for human callback."
+            )
+
         st.session_state.adk_workflow_result["borrower_state"] = borrower_state
 
         supervisor_decision = {
-            "next_agent": "crm",
-            "reason": "Routed to CRM because hardship options were exhausted and human callback was required.",
+            "next_agent": "hardship" if hardship_context else "negotiation",
+            "reason": supervisor_reason,
             "confidence": 0.85,
         }
         st.session_state.adk_workflow_result["supervisor_decision"] = supervisor_decision
 
-        compliance_decision = {
-            "compliance_status": "warning",
-            "risk_level": "medium",
-            "violations": ["sensitive_hardship"],
-            "reason": "Borrower reported hardship and could not commit to payment. Human callback is appropriate.",
-            "recommended_action": "human_review",
-        }
         st.session_state.adk_workflow_result["compliance_decision"] = compliance_decision
 
         crm_tool_result = dict(crm_tool_result)
@@ -1764,11 +1839,13 @@ else:
         crm_tool_result["final_status"] = "escalation"
         st.session_state.adk_workflow_result["crm_tool_result"] = crm_tool_result
 
-        st.session_state.adk_workflow_result["workflow_summary"] = (
-            "Borrower reported job loss and could not make a payment, offer a partial payment, "
-            "or provide a reliable payment timeline. The case was updated in CRM and routed for "
-            "human hardship callback."
-        )
+        specialist_decision = dict(specialist_decision)
+        specialist_decision["status"] = "escalate"
+        specialist_decision["reason"] = supervisor_reason
+        specialist_decision["next_question"] = ""
+        specialist_decision["summary"] = workflow_summary
+        st.session_state.adk_workflow_result["specialist_decision"] = specialist_decision
+        st.session_state.adk_workflow_result["workflow_summary"] = workflow_summary
 
     supervisor_reason = str(supervisor_decision.get("reason", ""))
     if "fallback" in supervisor_reason.lower() or "non-json" in supervisor_reason.lower():
