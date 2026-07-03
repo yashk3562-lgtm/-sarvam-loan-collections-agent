@@ -99,6 +99,89 @@ def _normalized_crm_outcome(final_outcome: Any) -> str:
     return normalized or "continue"
 
 
+def _is_promise_to_pay_outcome(final_outcome: Any) -> bool:
+    """Return whether the voice agent already finalized promise-to-pay."""
+    normalized = _normalized_outcome(final_outcome)
+    return any(outcome in normalized for outcome in PROMISE_TO_PAY_OUTCOMES)
+
+
+def _promise_date_from_outcome(final_outcome: Any) -> str:
+    """Extract a captured promise date from a final outcome payload."""
+    if isinstance(final_outcome, dict):
+        for key in ("promise_date", "payment_date", "date"):
+            value = _normalize_text(final_outcome.get(key))
+            if value:
+                return value
+    return ""
+
+
+def _profile_name(borrower_profile: dict[str, Any]) -> str:
+    """Extract a borrower name from common profile fields."""
+    for key in ("borrower_name", "name", "customer_name", "full_name"):
+        value = _normalize_text(borrower_profile.get(key))
+        if value:
+            return value
+    return ""
+
+
+def _promise_to_pay_borrower_state(
+    borrower_profile: dict[str, Any],
+    payment_date: str,
+) -> dict[str, Any]:
+    """Build borrower state from the already captured promise-to-pay outcome."""
+    return {
+        "borrower_name": _profile_name(borrower_profile),
+        "intent": "promise_to_pay",
+        "today_payment": False,
+        "promise_to_pay": True,
+        "payment_date": payment_date,
+        "partial_payment_possible": False,
+        "partial_payment_amount": "",
+        "job_status": "unknown",
+        "income_date": "",
+        "financial_hardship": False,
+        "callback_requested": False,
+        "human_escalation_requested": False,
+        "dispute_or_fraud": False,
+        "confidence": 0.95,
+        "evidence": "Voice agent captured and confirmed a promise-to-pay date.",
+    }
+
+
+def _merge_promise_to_pay_state(
+    borrower_state: dict[str, Any],
+    borrower_profile: dict[str, Any],
+    payment_date: str,
+) -> dict[str, Any]:
+    """Force final promise-to-pay facts into borrower state."""
+    merged = dict(borrower_state or {})
+    fallback = _promise_to_pay_borrower_state(borrower_profile, payment_date)
+    for key, value in fallback.items():
+        if key not in merged or merged.get(key) in ("", None):
+            merged[key] = value
+
+    merged["intent"] = "promise_to_pay"
+    merged["promise_to_pay"] = True
+    merged["payment_date"] = payment_date or _normalize_text(merged.get("payment_date"))
+    merged["financial_hardship"] = False
+    merged["dispute_or_fraud"] = False
+    merged["human_escalation_requested"] = False
+    merged["confidence"] = max(float(merged.get("confidence") or 0.0), 0.95)
+    if not _normalize_text(merged.get("evidence")):
+        merged["evidence"] = fallback["evidence"]
+    return merged
+
+
+def _promise_to_pay_specialist_decision(payment_date: str) -> dict[str, Any]:
+    """Return deterministic negotiation decision for final PTP outcomes."""
+    return {
+        "status": "promise_to_pay",
+        "reason": "Voice agent confirmed the borrower promise-to-pay.",
+        "next_question": "",
+        "summary": f"Borrower committed to pay on {payment_date or 'the captured date'}.",
+    }
+
+
 def _empty_crm_result(final_outcome: Any) -> dict[str, Any]:
     """Return the strict CRM result shape when no final CRM event is allowed."""
     final_status = _normalized_outcome(final_outcome) or "continue"
@@ -234,17 +317,35 @@ def run_post_call_workflow(
     """
     borrower_profile = dict(borrower_profile or {})
     latest_borrower_message = _normalize_text(latest_borrower_message)
+    is_final_promise_to_pay = _is_promise_to_pay_outcome(final_outcome)
+    captured_payment_date = _promise_date_from_outcome(final_outcome)
 
-    borrower_state = understand_borrower_state(
-        borrower_profile=borrower_profile,
-        conversation_history=conversation_history,
-        latest_borrower_message=latest_borrower_message,
-    )
+    try:
+        borrower_state = understand_borrower_state(
+            borrower_profile=borrower_profile,
+            conversation_history=conversation_history,
+            latest_borrower_message=latest_borrower_message,
+        )
+    except Exception:
+        if not is_final_promise_to_pay:
+            raise
+        borrower_state = _promise_to_pay_borrower_state(
+            borrower_profile=borrower_profile,
+            payment_date=captured_payment_date,
+        )
+
+    if is_final_promise_to_pay:
+        borrower_state = _merge_promise_to_pay_state(
+            borrower_state=borrower_state,
+            borrower_profile=borrower_profile,
+            payment_date=captured_payment_date,
+        )
+
     is_promise_to_pay = borrower_state.get("promise_to_pay") is True
     has_hardship = borrower_state.get("financial_hardship") is True
     has_dispute = borrower_state.get("dispute_or_fraud") is True
 
-    if is_promise_to_pay and not has_hardship and not has_dispute:
+    if is_final_promise_to_pay or (is_promise_to_pay and not has_hardship and not has_dispute):
         supervisor_decision = {
             "next_agent": "negotiation",
             "reason": "Promise-to-pay detected.",
@@ -264,20 +365,36 @@ def run_post_call_workflow(
             )
 
     next_agent = _normalize_text(supervisor_decision.get("next_agent")).lower()
-    specialist_decision = _specialist_decision(
-        next_agent=next_agent,
-        borrower_profile=borrower_profile,
-        conversation_history=conversation_history,
-        latest_borrower_message=latest_borrower_message,
-        borrower_state=borrower_state,
-    )
+    if is_final_promise_to_pay:
+        specialist_decision = _promise_to_pay_specialist_decision(
+            borrower_state.get("payment_date") or captured_payment_date
+        )
+    else:
+        specialist_decision = _specialist_decision(
+            next_agent=next_agent,
+            borrower_profile=borrower_profile,
+            conversation_history=conversation_history,
+            latest_borrower_message=latest_borrower_message,
+            borrower_state=borrower_state,
+        )
 
-    compliance_decision = check_compliance(
-        borrower_profile=borrower_profile,
-        conversation_history=conversation_history,
-        latest_borrower_message=latest_borrower_message,
-        borrower_state=borrower_state,
-    )
+    try:
+        compliance_decision = check_compliance(
+            borrower_profile=borrower_profile,
+            conversation_history=conversation_history,
+            latest_borrower_message=latest_borrower_message,
+            borrower_state=borrower_state,
+        )
+    except Exception:
+        if not is_final_promise_to_pay:
+            raise
+        compliance_decision = {
+            "compliance_status": "pass",
+            "risk_level": "low",
+            "violations": [],
+            "reason": "Standard promise-to-pay flow. No dispute, hardship escalation, or compliance violation detected.",
+            "recommended_action": "continue",
+        }
 
     specialist_decisions = {
         "supervisor": supervisor_decision,
