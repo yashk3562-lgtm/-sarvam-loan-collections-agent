@@ -94,6 +94,7 @@ DEFAULT_STATE: dict[str, Any] = {
     "last_audio_hash": "",
     "pending_confirmation": {},
     "last_agent_audio_b64": "",
+    "last_agent_audio_key": "",
     "agent_audio_by_message_index": {},
     "borrower_audio_by_message_index": {},
     "last_audio_message_index": -1,
@@ -1296,8 +1297,15 @@ def play_agent_audio(text: str, language: str, message_index: int | None = None)
     if audio_bytes:
         b64 = base64.b64encode(audio_bytes).decode("utf-8")
         idx = message_index if message_index is not None else len(st.session_state.messages) - 1
+        audio_key = hashlib.md5(f"assistant:{idx}:{b64[:80]}".encode("utf-8")).hexdigest()
+
+        if 0 <= idx < len(st.session_state.messages):
+            st.session_state.messages[idx]["audio_b64"] = b64
+            st.session_state.messages[idx]["audio_key"] = audio_key
+
         st.session_state.last_agent_audio_b64 = b64
         st.session_state.last_audio_message_index = idx
+        st.session_state.last_agent_audio_key = audio_key
         st.session_state.agent_audio_by_message_index[idx] = b64
         st.session_state.pending_audio_autoplay = True
 
