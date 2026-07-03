@@ -852,7 +852,7 @@ def sarvam_tts(text: str, language: str) -> bytes | None:
 
 def opening_line(account: dict[str, Any], language: str) -> str:
     first_name = account["name"].split()[0]
-    amount = account["emi_amount"]
+    amount = account.get("overdue_emi", account.get("emi_amount", ""))
 
     if language == "English":
         return f"Hello {first_name}. Your EMI of rupees {amount} is overdue. Can you pay today?"
@@ -1423,11 +1423,13 @@ with left:
             st.session_state.analytics["Calls Started"] += 1
 
             first_reply = opening_line(account, language)
-            st.session_state.messages.append({"role": "assistant", "content": first_reply})
+            assistant_message = {"role": "assistant", "content": first_reply}
+            st.session_state.messages.append(assistant_message)
+            assistant_message_index = len(st.session_state.messages) - 1
 
             if voice_enabled:
                 with st.spinner("Generating Sarvam opening voice..."):
-                    play_agent_audio(first_reply, language, len(st.session_state.messages) - 1)
+                    play_agent_audio(first_reply, language, assistant_message_index)
             st.rerun()
     else:
         st.caption(
