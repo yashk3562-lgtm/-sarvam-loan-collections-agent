@@ -41,6 +41,24 @@ The repository is organized into three main layers:
    - The dashboard module provides a lightweight monitoring and demo interface.
    - It displays borrower context, call activity, promise-to-pay outcomes, escalations, and workflow summaries.
 
+### Architecture diagram
+
+```mermaid
+flowchart LR
+    A[Borrower] --> B[Voice Agent]
+    B --> C[Speech to Text]
+    C --> D[Supervisor Agent]
+    D --> E[Negotiation Specialist]
+    D --> F[Hardship Specialist]
+    E --> G[Compliance Agent]
+    F --> G
+    G --> H[Workflow Orchestrator]
+    H --> I[CRM / Reminder / Escalation Actions]
+    H --> J[Dashboard]
+    B --> K[TTS Response]
+    K --> A
+```
+
 ## Project structure
 
 - adk_workflow/ - supervisor, specialists, Sarvam client helpers, and workflow orchestration
