@@ -5,8 +5,9 @@ from datetime import datetime
 from typing import Any
 
 import pandas as pd
-import requests
 import streamlit as st
+
+from adk_workflow.sarvam_client import extract_json_object, post_chat, post_stt, post_tts
 
 
 # =========================
@@ -23,10 +24,6 @@ st.set_page_config(
 # =========================
 
 SARVAM_API_KEY = st.secrets.get("SARVAM_API_KEY", "")
-
-CHAT_URL = "https://api.sarvam.ai/v1/chat/completions"
-TTS_URL = "https://api.sarvam.ai/text-to-speech"
-STT_URL = "https://api.sarvam.ai/speech-to-text"
 
 LANG_CODES = {
     "Hindi": "hi-IN",
@@ -127,105 +124,34 @@ def require_key() -> None:
         st.stop()
 
 
-def sarvam_headers(json_mode: bool = True) -> dict[str, str]:
-    headers = {
-        "api-subscription-key": SARVAM_API_KEY,
-        "Authorization": f"Bearer {SARVAM_API_KEY}",
-    }
-    if json_mode:
-        headers["Content-Type"] = "application/json"
-    return headers
-
-
 def sarvam_chat(messages: list[dict[str, str]]) -> str:
-    require_key()
-
-    payload = {
-        "model": "sarvam-105b",
-        "messages": messages,
-        "temperature": 0.2,
-        "max_tokens": 450,
-        "reasoning_effort": "medium",
-    }
-
-    response = requests.post(
-        CHAT_URL,
-        headers=sarvam_headers(json_mode=True),
-        json=payload,
+    data = post_chat(
+        messages=messages,
+        model="sarvam-105b",
+        temperature=0.2,
+        max_tokens=450,
+        reasoning_effort="medium",
         timeout=60,
     )
-
-    if response.status_code >= 400:
-        raise RuntimeError(f"Chat API error {response.status_code}: {response.text}")
-
-    data = response.json()
     return data["choices"][0]["message"]["content"]
 
 
 def sarvam_tts(text: str, language: str) -> bytes | None:
-    require_key()
-
-    payload = {
-        "text": text[:2400],
-        "target_language_code": LANG_CODES.get(language, "hi-IN"),
-        "speaker": SPEAKERS.get(language, "shubh"),
-        "model": "bulbul:v3",
-        "pace": 0.95,
-        "speech_sample_rate": 24000,
-        "output_audio_codec": "wav",
-        "temperature": 0.4,
-    }
-
-    response = requests.post(
-        TTS_URL,
-        headers=sarvam_headers(json_mode=True),
-        json=payload,
+    return post_tts(
+        text=text[:2400],
+        target_language_code=LANG_CODES.get(language, "hi-IN"),
+        speaker=SPEAKERS.get(language, "shubh"),
+        model="bulbul:v3",
+        pace=0.95,
+        speech_sample_rate=24000,
+        output_audio_codec="wav",
+        temperature=0.4,
         timeout=60,
     )
-
-    if response.status_code >= 400:
-        raise RuntimeError(f"TTS API error {response.status_code}: {response.text}")
-
-    data = response.json()
-    audios = data.get("audios", [])
-    if not audios:
-        return None
-
-    return base64.b64decode(audios[0])
 
 
 def sarvam_stt(audio_file: Any) -> str:
-    require_key()
-
-    audio_bytes = audio_file.getvalue()
-
-    files = {
-        "file": ("borrower_voice.wav", audio_bytes, "audio/wav"),
-    }
-
-    data = {
-        "model": "saaras:v3",
-        "mode": "codemix",
-    }
-
-    response = requests.post(
-        STT_URL,
-        headers=sarvam_headers(json_mode=False),
-        files=files,
-        data=data,
-        timeout=60,
-    )
-
-    if response.status_code >= 400:
-        raise RuntimeError(f"STT API error {response.status_code}: {response.text}")
-
-    result = response.json()
-    return (
-        result.get("transcript")
-        or result.get("text")
-        or result.get("transcription")
-        or ""
-    )
+    return post_stt(audio_file, model="saaras:v3", timeout=60)
 
 
 # =========================

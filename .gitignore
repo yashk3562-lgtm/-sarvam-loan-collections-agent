@@ -1,171 +1,35 @@
-import re
-import requests
-import streamlit as st
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+*.pyt
+*.project
+*.log
 
-CHAT_MODEL = "gpt-4"
-CHAT_URL = "https://api.example.com/chat"
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+voice_agent/.venv/
 
-DEFAULT_STATE = {
-    "messages": [],
-    "last_audio_message_index": -1,
-    "last_agent_audio_b64": "",
-    "audio_rendered_for_index": -1,
-    "pending_audio_autoplay": False,
-    # other state variables...
-}
+# Environment files
+.env
+*.env
 
-def sarvam_headers(authenticated: bool = False) -> dict:
-    headers = {"Content-Type": "application/json"}
-    if authenticated:
-        headers["Authorization"] = "Bearer your_token_here"
-    return headers
+# IDEs and editors
+.vscode/
+.idea/
+.DS_Store
+*.swp
 
-def is_bad_agent_reply(text: str) -> bool:
-    if not text or not isinstance(text, str):
-        return True
-    lower = text.lower().strip()
-    blocked = [
-        "keep each reply",
-        "output rule",
-        "compliance rules",
-        "conversation policy",
-        "business goal",
-        "reasoning guidance",
-        "if confirmed",
-        "return only",
-        "do not include",
-        "never output",
-        "message.content",
-        "follows the rules",
-        "response should be",
-        "my response",
-        "analysis",
-        "scratchpad",
-    ]
-    return any(term in lower for term in blocked)
+# Build artifacts
+dist/
+build/
+*.egg-info/
 
+# Misc local files
+=2.32.4
 
-def clean_agent_reply(text: str) -> str:
-    cleaned = re.sub(r"<final>|</final>", "", text or "", flags=re.IGNORECASE).strip()
-    cleaned = cleaned.strip(" -*\n\t\r\"'")
-    cleaned = re.sub(r"^(agent|assistant|reply|response|final)\s*[:\-]\s*", "", cleaned, flags=re.IGNORECASE).strip()
-    return cleaned
-
-def sarvam_chat(messages: list[dict[str, str]]) -> str:
-    payload = {
-        "model": CHAT_MODEL,
-        "messages": messages,
-        "temperature": 0.7,
-        "max_tokens": 150,
-    }
-    response = requests.post(
-        CHAT_URL,
-        headers=sarvam_headers(True),
-        json=payload,
-        timeout=90,
-    )
-    response.raise_for_status()
-    data = response.json()
-    choices = data.get("choices") or []
-    if not choices:
-        raise RuntimeError("Sarvam returned no choices.")
-    content = (choices[0].get("message") or {}).get("content") or ""
-    cleaned_content = content.strip()
-
-    final_match = re.search(r"<final>(.*?)</final>", cleaned_content, flags=re.DOTALL | re.IGNORECASE)
-    if final_match:
-        candidate = clean_agent_reply(re.sub(r"\s+", " ", final_match.group(1)).strip())
-    else:
-        candidate = clean_agent_reply(cleaned_content)
-    if not is_bad_agent_reply(candidate):
-        return candidate
-
-    parts = re.findall(r"<final>(.*?)</final>", cleaned_content, flags=re.DOTALL | re.IGNORECASE)
-    if parts:
-        candidate = clean_agent_reply(" ".join(parts).strip())
-        if not is_bad_agent_reply(candidate):
-            return candidate
-
-    spoken_reply = None
-    # Some logic to extract spoken_reply from content if applicable
-    if spoken_reply:
-        candidate = clean_agent_reply(spoken_reply)
-        if not is_bad_agent_reply(candidate):
-            return candidate
-
-    repair_messages = [
-        {
-            "role": "system",
-            "content": "You are a voice collections agent. Return only one short spoken borrower-facing reply in Hinglish/Hindi. No explanation, no labels, no markdown.",
-        },
-        {
-            "role": "user",
-            "content": f"The previous model response was unusable because it contained instruction text. Conversation context: {messages[-6:]}. Write the next spoken agent reply only.",
-        },
-    ]
-    repair_payload = {
-        "model": CHAT_MODEL,
-        "messages": repair_messages,
-        "temperature": 0.2,
-        "max_tokens": 120,
-        "reasoning_effort": "low",
-    }
-    repair_response = requests.post(
-        CHAT_URL,
-        headers=sarvam_headers(True),
-        json=repair_payload,
-        timeout=90,
-    )
-    if repair_response.status_code >= 400:
-        raise RuntimeError("Sarvam returned no clean spoken reply.")
-    repair_data = repair_response.json()
-    repair_choices = repair_data.get("choices") or []
-    if repair_choices:
-        repair_content = (repair_choices[0].get("message") or {}).get("content") or ""
-        candidate = clean_agent_reply(str(repair_content))
-        if candidate and not is_bad_agent_reply(candidate):
-            return candidate
-    raise RuntimeError("Sarvam returned no clean spoken reply.")
-
-def play_agent_audio(audio_data: str, language: str, message_index: int | None = None) -> None:
-    st.session_state.last_agent_audio_b64 = audio_data
-    st.session_state.last_audio_message_index = message_index if message_index is not None else len(st.session_state.messages) - 1
-    st.session_state.pending_audio_autoplay = True
-
-def render_latest_agent_audio() -> None:
-    idx = st.session_state.get("last_audio_message_index", -1)
-    audio_b64 = st.session_state.get("last_agent_audio_b64", "")
-
-    if not audio_b64 or idx < 0:
-        return
-
-    if not st.session_state.get("pending_audio_autoplay", False):
-        return
-
-    st.session_state.pending_audio_autoplay = False
-    st.session_state.audio_rendered_for_index = idx
-    st.markdown(
-        f"""
-        <audio id="latest-agent-audio" autoplay controls>
-            <source src="data:audio/wav;base64,{audio_b64}" type="audio/wav">
-        </audio>
-        <script>
-            const audio = document.getElementById("latest-agent-audio");
-            if (audio) {{ audio.play().catch(() => {{}}); }}
-        </script>
-        """,
-        unsafe_allow_html=True,
-    )
-
-# Start Call block snippet
-def start_call():
-    # ...
-    voice_enabled = True
-    first_reply = "Hello, how can I assist you today?"
-    language = "en"
-    # ...
-    if voice_enabled:
-        with st.spinner("Generating Sarvam opening voice..."):
-            play_agent_audio(first_reply, language, len(st.session_state.messages) - 1)
-        st.rerun()
-    # ...

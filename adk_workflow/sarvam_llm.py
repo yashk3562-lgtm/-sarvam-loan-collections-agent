@@ -10,41 +10,14 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from .sarvam_client import post_chat
 
-DEFAULT_SARVAM_CHAT_URL = os.getenv(
-    "SARVAM_CHAT_URL",
-    "https://api.sarvam.ai/v1/chat/completions",
-).strip()
+
 DEFAULT_SARVAM_CHAT_MODEL = os.getenv("SARVAM_CHAT_MODEL", "sarvam-30b").strip()
 
 
 class SarvamLLMError(RuntimeError):
     """Raised when Sarvam cannot produce a usable reasoning response."""
-
-
-def _sarvam_headers() -> dict[str, str]:
-    """Build authenticated headers for Sarvam chat completions."""
-    api_key = os.getenv("SARVAM_API_KEY", "").strip()
-    if not api_key:
-        raise SarvamLLMError("Missing SARVAM_API_KEY environment variable.")
-
-    return {
-        "api-subscription-key": api_key,
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-
-
-def _response_error(response: Any) -> str:
-    """Extract a compact error message from a Sarvam API response."""
-    try:
-        payload = response.json()
-    except ValueError:
-        return response.text
-
-    if isinstance(payload, dict):
-        return str(payload.get("message") or payload.get("error") or payload)
-    return str(payload)
 
 
 def sarvam_reasoning(
@@ -71,39 +44,17 @@ def sarvam_reasoning(
     Raises:
         SarvamLLMError: If configuration, transport, or response parsing fails.
     """
-    payload: dict[str, Any] = {
-        "model": os.getenv("SARVAM_CHAT_MODEL", DEFAULT_SARVAM_CHAT_MODEL).strip(),
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "reasoning_effort": reasoning_effort,
-    }
-
     try:
-        import requests
-
-        response = requests.post(
-            os.getenv("SARVAM_CHAT_URL", DEFAULT_SARVAM_CHAT_URL).strip(),
-            headers=_sarvam_headers(),
-            json=payload,
+        data = post_chat(
+            messages=messages,
+            model=os.getenv("SARVAM_CHAT_MODEL", DEFAULT_SARVAM_CHAT_MODEL).strip(),
+            temperature=temperature,
+            max_tokens=max_tokens,
+            reasoning_effort=reasoning_effort,
             timeout=timeout,
         )
-    except ImportError as exc:
-        raise SarvamLLMError(
-            "The requests package is required for Sarvam reasoning."
-        ) from exc
     except Exception as exc:
         raise SarvamLLMError(f"Sarvam request failed: {exc}") from exc
-
-    if response.status_code >= 400:
-        raise SarvamLLMError(
-            f"Sarvam chat failed with HTTP {response.status_code}: {_response_error(response)}"
-        )
-
-    try:
-        data = response.json()
-    except ValueError as exc:
-        raise SarvamLLMError("Sarvam returned a non-JSON response.") from exc
 
     choices = data.get("choices") if isinstance(data, dict) else None
     if not choices:

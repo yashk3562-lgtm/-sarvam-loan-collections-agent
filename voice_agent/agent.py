@@ -12,13 +12,19 @@ from datetime import datetime
 from typing import Any
 
 import pandas as pd
-import requests
 import streamlit as st
 from dotenv import load_dotenv
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from adk_workflow.sarvam_client import (
+    SarvamAPIError,
+    extract_json_object,
+    post_chat,
+    post_stt,
+    post_tts,
+)
 from adk_workflow.workflow import run_post_call_workflow
 
 load_dotenv(override=True)
@@ -206,24 +212,6 @@ def require_api_key() -> None:
         st.stop()
 
 
-def sarvam_headers(json_mode: bool = True) -> dict[str, str]:
-    headers = {
-        "api-subscription-key": SARVAM_API_KEY,
-        "Authorization": f"Bearer {SARVAM_API_KEY}",
-    }
-    if json_mode:
-        headers["Content-Type"] = "application/json"
-    return headers
-
-
-def parse_error(response: requests.Response) -> str:
-    try:
-        payload = response.json()
-        return payload.get("message") or payload.get("error") or response.text
-    except Exception:
-        return response.text
-
-
 def extract_json_object(text: str) -> dict[str, Any]:
     if not text or not isinstance(text, str):
         raise ValueError("Empty JSON response")
@@ -296,17 +284,14 @@ def repair_json_with_sarvam(raw_text: str, user_text: str) -> dict[str, Any]:
         "reasoning_effort": "low",
     }
 
-    repair_response = requests.post(
-        CHAT_URL,
-        headers=sarvam_headers(True),
-        json=repair_payload,
+    repair_data = post_chat(
+        messages=repair_messages,
+        model=CHAT_MODEL,
+        max_tokens=180,
+        temperature=0.05,
+        reasoning_effort="low",
         timeout=45,
     )
-
-    if repair_response.status_code >= 400:
-        raise RuntimeError(f"Sarvam JSON repair failed: {repair_response.status_code} - {parse_error(repair_response)}")
-
-    repair_data = repair_response.json()
     repair_choices = repair_data.get("choices") or []
     if not repair_choices:
         raise RuntimeError(f"Unexpected JSON repair response: {repair_data}")
@@ -318,33 +303,7 @@ def repair_json_with_sarvam(raw_text: str, user_text: str) -> dict[str, Any]:
 
 def sarvam_stt(audio_file: Any) -> str:
     require_api_key()
-
-    files = {
-        "file": ("borrower_response.wav", audio_file.getvalue(), "audio/wav"),
-    }
-    data = {
-        "model": STT_MODEL,
-        "mode": "codemix",
-    }
-
-    response = requests.post(
-        STT_URL,
-        headers=sarvam_headers(False),
-        files=files,
-        data=data,
-        timeout=90,
-    )
-
-    if response.status_code >= 400:
-        raise RuntimeError(f"Sarvam STT failed: {response.status_code} - {parse_error(response)}")
-
-    payload = response.json()
-    return (
-        payload.get("transcript")
-        or payload.get("text")
-        or payload.get("transcription")
-        or ""
-    ).strip()
+    return post_stt(audio_file, model=STT_MODEL, timeout=90)
 
 
 #
@@ -732,17 +691,15 @@ Keep under 22 words.
         "reasoning_effort": "low",
     }
 
-    response = requests.post(
-        CHAT_URL,
-        headers=sarvam_headers(True),
-        json=payload,
+    data = post_chat(
+        messages=messages,
+        model=CHAT_MODEL,
+        temperature=0.2,
+        max_tokens=80,
+        reasoning_effort="low",
         timeout=45,
     )
 
-    if response.status_code >= 400:
-        raise RuntimeError(f"Sarvam plain reply failed: {response.status_code} - {parse_error(response)}")
-
-    data = response.json()
     choices = data.get("choices") or []
     if not choices:
         raise RuntimeError(f"Unexpected Sarvam plain reply response: {data}")
@@ -816,25 +773,25 @@ def generate_agent_turn(account: dict[str, Any], language: str, user_text: str) 
         "reasoning_effort": "low",
     }
 
-    response = requests.post(
-        CHAT_URL,
-        headers=sarvam_headers(True),
-        json=payload,
-        timeout=75,
-    )
-
-    if response.status_code >= 400:
+    try:
+        data = post_chat(
+            messages=messages,
+            model=CHAT_MODEL,
+            temperature=0.15,
+            max_tokens=240,
+            reasoning_effort="low",
+            timeout=75,
+        )
+    except SarvamAPIError:
         return safe_unknown_response_turn(
             account=account,
             conversation=conversation,
             user_text=user_text,
             reason=(
-                f"Sarvam chat unavailable ({response.status_code}). "
-                "Routed to human callback unless promise-to-pay or hardship guardrails applied."
+                "Sarvam chat unavailable. Routed to human callback unless promise-to-pay or hardship guardrails applied."
             ),
         )
 
-    data = response.json()
     choices = data.get("choices") or []
     if not choices:
         raise RuntimeError(f"Unexpected chat response: {data}")
@@ -915,23 +872,13 @@ def sarvam_tts(text: str, language: str) -> bytes | None:
         "temperature": 0.3,
     }
 
-    response = requests.post(
-        TTS_URL,
-        headers=sarvam_headers(True),
-        json=payload,
+    return post_tts(
+        text,
+        target_language_code=LANGUAGE_CODES.get(language, "hi-IN"),
+        speaker=SPEAKERS.get(language, "shubh"),
+        model=TTS_MODEL,
         timeout=90,
     )
-
-    if response.status_code >= 400:
-        raise RuntimeError(f"Sarvam TTS failed: {response.status_code} - {parse_error(response)}")
-
-    payload = response.json()
-    audios = payload.get("audios") or []
-
-    if not audios:
-        return None
-
-    return base64.b64decode(audios[0])
 
 
 def opening_line(account: dict[str, Any], language: str) -> str:
@@ -1543,9 +1490,6 @@ with st.sidebar:
 
 with st.expander("API diagnostics", expanded=False):
     st.caption(f"Build: {APP_VERSION}")
-    st.caption(f"Chat: {CHAT_URL}")
-    st.caption(f"STT: {STT_URL}")
-    st.caption(f"TTS: {TTS_URL}")
     st.caption(f"Model: {CHAT_MODEL}")
     if st.session_state.get("last_agent_parse_error"):
         st.caption(f"Last agent parse recovery: {st.session_state.last_agent_parse_error}")
