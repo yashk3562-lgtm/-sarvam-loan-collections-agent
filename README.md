@@ -45,23 +45,43 @@ The repository is organized into three main layers:
 
 ```mermaid
 flowchart LR
-    A[Borrower] --> B[Voice Agent]
-    B --> C[Speech to Text]
-    C --> D[Supervisor Agent]
-    D --> E[Negotiation Specialist]
-    D --> F[Hardship Specialist]
-    E --> G[Compliance Agent]
-    F --> G
-    G --> H[Workflow Orchestrator]
-    H --> I[CRM / Reminder / Escalation Actions]
-    H --> J[Dashboard]
-    B --> K[TTS Response]
-    K --> A
+    A[Borrower] --> B[Voice Agent UI]
 
-    D --> L[Sarvam 30B Reasoning]
-    C --> L
-    G --> L
-    H --> L
+    subgraph V[Voice layer powered by Sarvam 30B]
+        C[Speech to Text]
+        D[Voice response generation]
+        E[Text to Speech]
+    end
+
+    B --> C
+    C --> F[Conversation Turn Manager]
+    F --> G[Supervisor Agent]
+
+    subgraph M105[Sarvam 105B]
+        H[Reasoning for supervisor, specialists, compliance, and workflow]
+    end
+
+    subgraph O[Google ADK agent orchestration powered by Sarvam 105B]
+        G --> I[Negotiation Specialist]
+        G --> J[Hardship Specialist]
+        I --> K[Compliance Agent]
+        J --> K
+        K --> L[Workflow Orchestrator]
+    end
+
+    G -.-> H
+    I -.-> H
+    J -.-> H
+    K -.-> H
+    L -.-> H
+
+    L --> N[Promise-to-Pay / Restructure / Escalation]
+    L --> O2[CRM / Reminder Actions]
+    L --> P[Dashboard]
+    L --> F
+    F --> D
+    D --> E
+    E --> A
 ```
 
 ## Project structure
