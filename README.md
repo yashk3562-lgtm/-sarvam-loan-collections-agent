@@ -57,6 +57,11 @@ flowchart LR
     H --> J[Dashboard]
     B --> K[TTS Response]
     K --> A
+
+    D --> L[Sarvam 30B Reasoning]
+    C --> L
+    G --> L
+    H --> L
 ```
 
 ## Project structure
